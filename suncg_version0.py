@@ -360,6 +360,17 @@ def categorical_crossentropy(y_true, y_pred, params):
 
         y_true = tf.clip_by_value(y_true, EPSILON, 1.0 - EPSILON)
         y_pred = tf.clip_by_value(y_pred, EPSILON, 1.0 - EPSILON)
+        
+        freespace_label = y_true.shape[-1] - 1
+        freespace_mask = tf.equal(tf.argmax(y_true, axis=-1), freespace_label)
+        known_mask     = ~tf.equal(tf.argmax(y_true, axis=-1), freespace_label-1)
+        cared_mask     = ~tf.equal(tf.argmax(y_true, axis=-1), freespace_label-2)
+        occupied_mask  = ~freespace_mask & known_mask & cared_mask
+        ceil_mask = tf.equal(tf.argmax(y_true, axis=-1), 0)
+        floor_mask = tf.equal(tf.argmax(y_true, axis=-1), 1)
+        wall_mask = tf.equal(tf.argmax(y_true, axis=-1), 2)
+        object_mask = tf.logical_or(tf.logical_or(ceil_mask,floor_mask),wall_mask)
+
 
         # Measure how close we are to unknown class.
         unkown_weights = 1 - y_true[..., -2][..., None]
@@ -377,8 +388,16 @@ def categorical_crossentropy(y_true, y_pred, params):
         # Compute weighted cross entropy.
         cross_entropy = -tf.reduce_sum(weights * y_true * tf.log(y_pred)) / \
                          tf.reduce_sum(weights)
+        weighted_cross_entropy = weights*y_true * tf.log(y_pred)
+        occupied_cross_entropy = \
+            -tf.reduce_sum(tf.boolean_mask(weighted_cross_entropy, occupied_mask)) / \
+             (tf.reduce_sum(weights*tf.expand_dims(tf.cast(occupied_mask, tf.float32),-1)) + EPSILON)
+             
+        object_cross_entropy = \
+            -tf.reduce_sum(tf.boolean_mask(weighted_cross_entropy, object_mask)) / \
+             (tf.reduce_sum(weights*tf.expand_dims(tf.cast(object_mask, tf.float32),-1)) + EPSILON)
 
-    return cross_entropy
+    return cross_entropy+params["loss_weight"]*occupied_cross_entropy+object_cross_entropy
 '''
 def categorical_crossentropy(y_true, y_pred, params):
     nclasses = y_true.shape[-1]
@@ -617,24 +636,12 @@ def preprocess_dataset_item(scene_path,scene_id,nclasses):
     print("extracted data from {}".format(scene_id))
     return ProcessedItem(groundtruth,datacost)
 
-
-def build_data_generator(data_path,params,istrain=False):
-    epoch_npasses = params["epoch_npasses"]
-    batch_size = params["batch_size"]
-    nrows = params["nrows"]
-    ncols = params["ncols"]
-    nslices = params["nslices"]
+def get_small_list(data_path,scene_list,params,start_index,end_index):
     nclasses = params["nclasses"]
-    #if istrain==True:
-    #    class_weights_data=np.load(os.path.join(data_path,"class_weights.npz"))
-    #    class_weights=class_weights_data["class_weights"]
-
-    #scene_list = []
     datacosts = []
     groundtruths = []
-    scene_list = get_list_dir(data_path)
-    n=min(100,len(scene_list))
-    for i, scene_name in enumerate(scene_list[:n]):
+    #scene_list = get_list_dir(data_path)
+    for i, scene_name in enumerate(scene_list[start_index:end_index]):
         print("Loading {} [{}/{}]".format(scene_name, i + 1, len(scene_list)))
         
         datacost_path = os.path.join(data_path, scene_name,"norm_datacost.npz")
@@ -652,8 +659,20 @@ def build_data_generator(data_path,params,istrain=False):
         
         datacosts.append(datacost)
         groundtruths.append(groundtruth)
+    return datacosts,groundtruths
 
-    idxs = np.arange(len(datacosts))
+def build_data_generator(data_path,params,istrain=False):
+    epoch_npasses = params["epoch_npasses"]
+    batch_size = params["batch_size"]
+    nrows = params["nrows"]
+    ncols = params["ncols"]
+    nslices = params["nslices"]
+    nclasses = params["nclasses"]
+
+    scene_list = get_list_dir(data_path)
+    #n = len(scene_list)//12+1
+
+    
     print("-------------------------number of scene is{}--------------------------------".format(len(scene_list)))
     batch_datacost = np.empty(
         (batch_size, nrows, ncols, nslices, nclasses), dtype=np.float32)
@@ -663,78 +682,90 @@ def build_data_generator(data_path,params,istrain=False):
     npasses = 0
 
     while True:
-        # Shuffle all data samples.
-        np.random.shuffle(idxs)
-
-        # One epoch iterates once over all scenes.
-        for batch_start_idx in range(0, len(idxs), batch_size):
-            # Determine the random scenes for current batch.
-            batch_end_idx = min(batch_start_idx + batch_size, len(idxs))
-            batch_idxs = idxs[batch_start_idx:batch_end_idx]
-
-            # By default, set all voxels to unobserved.
-            batch_datacost[:] = 0
-            batch_groundtruth[:] = 1.0 / nclasses
-
-            # Prepare data for random scenes in current batch.
-            for i, idx in enumerate(batch_idxs):
-                datacost = datacosts[idx]
-                groundtruth = groundtruths[idx]
-                m=False
-                while m==False:
-
-                    # Determine a random crop of the input data.
-                    row_start = np.random.randint(
-                        0, max(datacost.shape[0] - nrows, 0) + 1)
-                    col_start = np.random.randint(
-                        0, max(datacost.shape[1] - ncols, 0) + 1)
-                    slice_start = np.random.randint(
-                        0, max(datacost.shape[2] - nslices, 0) + 1)
-                    row_end = min(row_start + nrows, datacost.shape[0])
-                    col_end = min(col_start + ncols, datacost.shape[1])
-                    slice_end = min(slice_start + nslices, datacost.shape[2])
-                    
-                    if is_sample_valid(groundtruth=groundtruth[row_start:row_end,col_start:col_end,slice_start:slice_end],\
-                                       occupancy_threshold=0.005):
-                        # Copy the random crop of the data cost.
-                        batch_datacost[i,
-                                       :row_end-row_start,
-                                       :col_end-col_start,
-                                       :slice_end-slice_start] = \
-                            datacost[row_start:row_end,
-                                     col_start:col_end,
-                                     slice_start:slice_end]
+        for start_index in range(0,len(scene_list),6):
+            datacosts = []
+            groundtruths = []
+            #start_index = i*12
+            end_index = min(start_index+6,len(scene_list))
+            #print("minibatch_{}".format(i))
+            #print("-------------------------start scene_name is {}--------------------------------".format(scene_list[start_index]))
+            #print("-------------------------end scene_name is {}--------------------------------".format(scene_list[end_index]))
+            datacosts,groundtruths = get_small_list(data_path,scene_list,params,start_index,end_index)
+            #print("len of datacosts:",len(datacosts))
+            # Shuffle all data samples.
+            idxs = np.arange(len(datacosts))
+            np.random.shuffle(idxs)
         
-                        # Copy the random crop of the groundtruth.
-                        batch_groundtruth[i,
-                                          :row_end-row_start,
-                                          :col_end-col_start,
-                                          :slice_end-slice_start] = \
-                            groundtruth[row_start:row_end,
-                                        col_start:col_end,
-                                        slice_start:slice_end]
-                        m=True
-
-                # Randomly rotate around z-axis.
-                num_rot90 = np.random.randint(4)
-                if num_rot90 > 0:
-                    batch_datacost[i] = np.rot90(batch_datacost[i],
-                                                 k=num_rot90,
-                                                 axes=(0, 1))
-                    batch_groundtruth[i] = np.rot90(batch_groundtruth[i],
-                                                    k=num_rot90,
-                                                    axes=(0, 1))
-
-                # Randomly flip along x and y axis.
-                flip_axis = np.random.randint(3)
-                if flip_axis == 0 or flip_axis == 1:
-                    batch_datacost[i] = np.flip(batch_datacost[i],
-                                                axis=flip_axis)
-                    batch_groundtruth[i] = np.flip(batch_groundtruth[i],
-                                                   axis=flip_axis)
-
-            yield (batch_datacost[:len(batch_idxs)],
-                   batch_groundtruth[:len(batch_idxs)])
+        # One epoch iterates once over all scenes.
+            for batch_start_idx in range(0, len(idxs), batch_size):
+                # Determine the random scenes for current batch.
+                batch_end_idx = min(batch_start_idx + batch_size, len(idxs))
+                batch_idxs = idxs[batch_start_idx:batch_end_idx]
+    
+                # By default, set all voxels to unobserved.
+                batch_datacost[:] = 0
+                batch_groundtruth[:] = 1.0 / nclasses
+    
+                # Prepare data for random scenes in current batch.
+                for i, idx in enumerate(batch_idxs):
+                    datacost = datacosts[idx]
+                    groundtruth = groundtruths[idx]
+                    m=False
+                    while m==False:
+    
+                        # Determine a random crop of the input data.
+                        row_start = np.random.randint(
+                            0, max(datacost.shape[0] - nrows, 0) + 1)
+                        col_start = np.random.randint(
+                            0, max(datacost.shape[1] - ncols, 0) + 1)
+                        slice_start = np.random.randint(
+                            0, max(datacost.shape[2] - nslices, 0) + 1)
+                        row_end = min(row_start + nrows, datacost.shape[0])
+                        col_end = min(col_start + ncols, datacost.shape[1])
+                        slice_end = min(slice_start + nslices, datacost.shape[2])
+                        
+                        if is_sample_valid(groundtruth=groundtruth[row_start:row_end,col_start:col_end,slice_start:slice_end],\
+                                           occupancy_threshold=0.005):
+                            # Copy the random crop of the data cost.
+                            batch_datacost[i,
+                                           :row_end-row_start,
+                                           :col_end-col_start,
+                                           :slice_end-slice_start] = \
+                                datacost[row_start:row_end,
+                                         col_start:col_end,
+                                         slice_start:slice_end]
+            
+                            # Copy the random crop of the groundtruth.
+                            batch_groundtruth[i,
+                                              :row_end-row_start,
+                                              :col_end-col_start,
+                                              :slice_end-slice_start] = \
+                                groundtruth[row_start:row_end,
+                                            col_start:col_end,
+                                            slice_start:slice_end]
+                            m=True
+    
+                    # Randomly rotate around z-axis.
+                    num_rot90 = np.random.randint(4)
+                    if num_rot90 > 0:
+                        batch_datacost[i] = np.rot90(batch_datacost[i],
+                                                     k=num_rot90,
+                                                     axes=(0, 1))
+                        batch_groundtruth[i] = np.rot90(batch_groundtruth[i],
+                                                        k=num_rot90,
+                                                        axes=(0, 1))
+    
+                    # Randomly flip along x and y axis.
+                    flip_axis = np.random.randint(3)
+                    if flip_axis == 0 or flip_axis == 1:
+                        batch_datacost[i] = np.flip(batch_datacost[i],
+                                                    axis=flip_axis)
+                        batch_groundtruth[i] = np.flip(batch_groundtruth[i],
+                                                       axis=flip_axis)
+    
+                yield (batch_datacost[:len(batch_idxs)],
+                       batch_groundtruth[:len(batch_idxs)])
+        
 
         npasses += 1
 
@@ -1116,20 +1147,20 @@ def train_model(data_path,val_path, model_path, params):
 def parse_args():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--scene_train_path", default="/cluster/scratch/haliang/SCANNET/norm_scannetdata/train")
-    parser.add_argument("--scene_val_path", default="/cluster/scratch/haliang/SCANNET/norm_scannetdata/val")
+    parser.add_argument("--scene_train_path", default="/cluster/scratch/haliang/SUNCG_Data/resolution2/norm_suncgdata/train")
+    parser.add_argument("--scene_val_path", default="/cluster/scratch/haliang/SUNCG_Data/resolution2/norm_suncgdata/val")
     #parser.add_argument("--scene_train_list_path", required=True)
     #parser.add_argument("--scene_val_list_path", required=True)
     parser.add_argument("--model_path", required=True)
 
-    parser.add_argument("--nclasses", type=int, default=42)
+    parser.add_argument("--nclasses", type=int, default=38)
 
     parser.add_argument("--nlevels", type=int, default=3)
     parser.add_argument("--nrows", type=int, default=24)
     parser.add_argument("--ncols", type=int, default=24)
     parser.add_argument("--nslices", type=int, default=24)
 
-    parser.add_argument("--niter", type=int, default=51)
+    parser.add_argument("--niter", type=int, default=45)
     parser.add_argument("--sig", type=float, default=0.2)
     parser.add_argument("--tau", type=float, default=0.2)
     parser.add_argument("--lam", type=float, default=1.0)
@@ -1139,7 +1170,7 @@ def parse_args():
     parser.add_argument("--epoch_npasses", type=int, default=1)
     parser.add_argument("--val_nbatches", type=int, default=15)
     parser.add_argument("--learning_rate", type=float, default=0.0001)
-    parser.add_argument("--softmax_scale", type=float, default=10)
+    parser.add_argument("--softmax_scale", type=float, default=5)
     parser.add_argument("--initial_learning_rate", type=float, default=0.0005)
     parser.add_argument("--decay_rate", type=float, default=0.99)
     parser.add_argument("--decay_step", type=int, default=90) 

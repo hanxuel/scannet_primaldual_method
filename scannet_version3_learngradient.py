@@ -5,8 +5,8 @@ Created on Fri May  3 22:45:24 2019
 
 @author: hliang
 """
-#new dataset;all steps are different;
-#three level each level share same weights
+#new dataset niter 15*3, three level; each level have 15 different projector weights and gradient weights
+#share variable between different level
 import os
 import glob
 import argparse
@@ -15,21 +15,21 @@ import tensorflow as tf
 import multiprocessing
 import joblib
 import collections
-import psutil,datetime,time
 from collections import Counter
 from numpy import *
-
+import psutil
+import os,datetime,time
 ProcessedItem = collections.namedtuple(
     'ProcessedItem', ['groundtruth', 'datacost'])
 
 EPSILON = 10e-8
 
-def getMemCpu(): 
-    data = psutil.virtual_memory() 
-    total = data.total 
-    free = data.available 
-    memory =(int(round(data.percent))) 
-    cpu = psutil.cpu_percent(interval=1) 
+def getMemCpu():
+    data = psutil.virtual_memory()
+    total = data.total #
+    free = data.available #
+    memory =(int(round(data.percent)))
+    cpu = psutil.cpu_percent(interval=1)
     return memory,cpu
 
 def mkdir_if_not_exists(path):
@@ -37,16 +37,16 @@ def mkdir_if_not_exists(path):
     if not os.path.exists(path):
         os.makedirs(path)
 
-def stepsize_variable(name,shape,value=1.0):
-    init=tf.constant_initializer(value)
-    return tf.get_variable(name,shape,dtype=tf.float32,
-                           initializer=init)
-    
+
 def conv_weight_variable(name, shape, stddev=1.0):
     #initializer = tf.truncated_normal_initializer(stddev=stddev)
     return tf.get_variable(name, shape, dtype=tf.float32,
                            initializer=tf.truncated_normal_initializer(stddev=stddev))
 
+def stepsize_variable(name,shape,value=1.0):
+    init=tf.constant_initializer(value)
+    return tf.get_variable(name,shape,dtype=tf.float32,
+                           initializer=init)
 
 def bias_weight_variable(name, shape, cval=0.0):
     initializer = tf.constant_initializer(cval)
@@ -57,6 +57,9 @@ def bias_weight_variable(name, shape, cval=0.0):
 def conv3d(x, weights, name=None):
     return tf.nn.conv3d(x, weights, name=name,
                         strides=[1, 1, 1, 1, 1], padding="SAME")
+    
+def Relu(x,name=None):
+    return tf.nn.relu(x,name=name)
 
 
 def conv3d_adj(x, weights, num_channels, name=None):
@@ -231,92 +234,115 @@ def eachlabel_classification_accuracy(y_true, y_pred,labels):
     count=tf.stack(count)
     return accuracy, count
 
-def update_lagrangian(u_, l, level,iter):
+def update_lagrangian(u_, l, iter):
     assert len(u_) == len(l)
 
     with tf.name_scope("lagrange_update"):
-        with tf.variable_scope("step_{}".format(iter),reuse=True):
+        with tf.variable_scope("step{}".format(iter),reuse=True):
             sig = tf.get_variable("sig")
-        sum_u = tf.reduce_sum(u_[level], axis=4, keep_dims=False)
-        l[level] += sig * (sum_u - 1.0)
+        sum_u = tf.reduce_sum(u_[-1], axis=4, keep_dims=False)
+        l[-1] += sig * (sum_u - 1.0)
 
 
-def update_dual(u_, m, level,iter):
+def update_dual(u_, m, iter):
     assert len(u_) == len(m)
 
     with tf.name_scope("dual_update"):
-        with tf.variable_scope("step_{}".format(iter),reuse=True):
-            sig = tf.get_variable("sig")
-        with tf.variable_scope("weights_level{}".format(level), reuse=True):
+        with tf.variable_scope("weights_step{}".format(iter), reuse=True):
             w1 = tf.get_variable("w1")
-            w2 = tf.get_variable("w2")
+            #w2 = tf.get_variable("w2")
 
-        _, nrows, ncols, nslices, nclasses = \
-            u_[level].get_shape().as_list()
-        batch_size = tf.shape(u_[level])[0]
+        _, nrows, ncols, nslices, nclasses =\
+        u_[-1].get_shape().as_list()
+        batch_size = tf.shape(u_[-1])[0]
 
-        if level + 1 < len(u_):
-            grad_u1 = conv3d(u_[level], w1)
-            grad_u2 = conv3d(u_[level + 1], w2)
-            grad_u = grad_u1 + resize_volumes(grad_u2, 2, 2, 2)
-        else:
-            grad_u = conv3d(u_[level], w1)
-
-        m[level] += sig * grad_u
-
-        m_rshp = tf.reshape(m[level], [batch_size, nrows, ncols,
-                                       nslices, nclasses, 3])
-
+        #if level + 1 < len(u_):
+        #    grad_u1 = conv3d(u_[level], w1)
+        #    grad_u2 = conv3d(u_[level + 1], w2)
+        #    grad_u = grad_u1 + resize_volumes(grad_u2, 2, 2, 2)
+        #else:
+        with tf.variable_scope("step{}".format(iter), reuse=True):
+            sig = tf.get_variable("sig")
+        grad_u = conv3d(u_[-1], w1)
+        grad_u = sig * grad_u
+        update = tf.concat([m[-1],grad_u],axis=4)
+        #print("update_dim for u_",tf.shape(update))
+        with tf.variable_scope("dual_proxmitor_step{}".format(iter),reuse=True):
+            p1 = tf.get_variable("p1")
+            p2 = tf.get_variable("p2")
+            d_pro1 = tf.get_variable("d_pro1")
+            d_pro2 = tf.get_variable("d_pro2")
+            #p3 = tf.get_variable("p3")
+            
+        update = Relu(conv3d(update, p1)+d_pro1) # p1 shape:[*,*,*,6*nclasses,*]
+        #update = Relu(conv3d(update, p2)) # p2 shape:[*,*,*,*,*]
+        update = conv3d(update, p2) + d_pro2# p3 shape:[*,*,*,*,3*nclasses]
+        m[-1] = m[-1] + update
+        #m = m + sig * update
+        m_rshp = tf.reshape(m[-1], [batch_size, nrows, ncols,
+                                nslices, nclasses, 3])
         m_norm = tf.norm(m_rshp, ord="euclidean", axis=5, keep_dims=True)
-        m_norm = tf.maximum(m_norm, 1.0)
+        m_norm = tf.maximum(m_norm, 1.0) 
         m_normalized = tf.divide(m_rshp, m_norm)
+        m[-1] = tf.reshape(m_normalized, [batch_size, nrows, ncols,
+                                      nslices, nclasses * 3])
 
-        m[level] = tf.reshape(m_normalized, [batch_size, nrows, ncols,
-                                             nslices, nclasses * 3])
 
-
-def update_primal(u, m, l, d, level,iter):
+def update_primal(u, u_, m, l, d, level, iter):
     assert len(u) == len(m)
     assert len(u) == len(l)
-    assert len(u) == len(d)
+    #assert len(u) == len(d)
 
     with tf.name_scope("primal_update"):
-        with tf.variable_scope("step_{}".format(iter),reuse=True):
-            tau = tf.get_variable("tau")
-        with tf.variable_scope("weights_level{}".format(level), reuse=True):
+        with tf.variable_scope("weights_step{}".format(iter), reuse=True):
             w1 = tf.get_variable("w1")
-            w2 = tf.get_variable("w2")
+            #w2 = tf.get_variable("w2")
 
         _, nrows, ncols, nslices, nclasses = \
-            u[level].get_shape().as_list()
-        batch_size = tf.shape(u[level])[0]
+            u[-1].get_shape().as_list()
+        batch_size = tf.shape(u[-1])[0]
 
-        if level + 1 < len(u):
-            div_m1 = conv3d_adj(m[level], w1, nclasses)
-            div_m2 = conv3d_adj(m[level + 1], w2, nclasses)
-            div_m = div_m1 + resize_volumes(div_m2, 2, 2, 2)
-        else:
-            div_m = conv3d_adj(m[level], w1, nclasses)
+        with tf.variable_scope("step{}".format(iter),reuse=True):
+            tau = tf.get_variable("tau")
+            
+        l_rshp = tf.reshape(l[-1], [batch_size, nrows, ncols, nslices, 1])
+        div_m = conv3d_adj(m[-1], w1, nclasses) #nclasses
+        
+        d_term = d[len(d)-level-1]+l_rshp+div_m #nclasses
+        update = -tau * d_term
+        
+        primal = tf.concat([u[-1],u_[-1]],axis=-1) #2*nclasses
+        update = tf.concat([primal,update],axis=-1) #3*nclasses
+        #print("shape of update:",tf.shape(update))
+        with tf.variable_scope("primal_proxmitor_step{}".format(iter),reuse=True):
+            pp1 = tf.get_variable("pp1") #  pp1 shape [*,*,*,2*nclasses+nclasses+nclasses,*]
+            pp2 = tf.get_variable("pp2") #
+            p_pro1 = tf.get_variable("p_pro1")
+            p_pro2 = tf.get_variable("p_pro2")
+            #pp3 = tf.get_variable("pp3") # pp3 shape [*,*,*,*,2*nclasses]
+        update1 = Relu(conv3d(update, pp1)+p_pro1) 
+        #update = Relu(conv3d(update, pp2))
+        update2 = conv3d(update1, pp2)+p_pro2
+        
+        primal += update2
+        #primal = tf.minimum(1.0, tf.maximum(primal, 0.0))
+        u_[-1] = tf.minimum(-1.0, tf.maximum(primal[...,nclasses:], 2.0))
+        u[-1]  = tf.minimum(1.0, tf.maximum(primal[...,:nclasses], 0.0))
+        #u = tf.minimum(1.0, tf.maximum(u, 0.0))
 
-        l_rshp = tf.reshape(l[level], [batch_size, nrows, ncols, nslices, 1])
 
-        u[level] -= tau * (d[level] + l_rshp + div_m)
+def primal_dual(u, u_, m, l, d, level, iter):
+    #u_0 = list(u)
 
-        u[level] = tf.minimum(1.0, tf.maximum(u[level], 0.0))
+    #for level in list(range(len(u)))[::-1]:
+    with tf.name_scope("primal_dual_iter{}_level{}".format(iter,level)):
+        update_dual(u_, m, iter)
 
+        update_lagrangian(u_, l, iter)
 
-def primal_dual(u, u_, m, l, d, iter):
-    u_0 = list(u)
+        update_primal(u, u_, m, l, d, level, iter)
 
-    for level in list(range(len(u)))[::-1]:
-        with tf.name_scope("primal_dual_iter{}_level{}".format(iter, level)):
-            update_dual(u_, m, level,iter)
-
-            update_lagrangian(u_, l,level,iter)
-
-            update_primal(u, m, l, d, level,iter)
-
-            u_[level] = 2 * u[level] - u_0[level]
+            #u_[level] = 2 * u[level] - u_0[level]
 
     return u, u_, m, l
 
@@ -360,6 +386,12 @@ def categorical_crossentropy(y_true, y_pred, params):
 
         y_true = tf.clip_by_value(y_true, EPSILON, 1.0 - EPSILON)
         y_pred = tf.clip_by_value(y_pred, EPSILON, 1.0 - EPSILON)
+        
+        freespace_label = y_true.shape[-1] - 1
+        freespace_mask = tf.equal(tf.argmax(y_true, axis=-1), freespace_label)
+        known_mask     = ~tf.equal(tf.argmax(y_true, axis=-1), freespace_label-1)
+        not_unobserved_mask = tf.reduce_any(tf.greater(y_true, 0.5), axis=-1)
+        occupied_mask  = ~freespace_mask & known_mask & not_unobserved_mask
 
         # Measure how close we are to unknown class.
         unkown_weights = 1 - y_true[..., -2][..., None]
@@ -377,79 +409,13 @@ def categorical_crossentropy(y_true, y_pred, params):
         # Compute weighted cross entropy.
         cross_entropy = -tf.reduce_sum(weights * y_true * tf.log(y_pred)) / \
                          tf.reduce_sum(weights)
-
-    return cross_entropy
-'''
-def categorical_crossentropy(y_true, y_pred, params):
-    nclasses = y_true.shape[-1]
-
-    with tf.name_scope("categorical_cross_entropy"):
-        y_true = tf.nn.softmax(params["softmax_scale"] * y_true)
-        y_true = tf.clip_by_value(y_true, EPSILON, 1.0 - EPSILON)
-        y_pred = tf.clip_by_value(y_pred, EPSILON, 1.0 - EPSILON)
-
-        # Measure how close we are to unknown class.
-        # unkown_weights = 1 - y_true[..., -2][..., None]
-        freespace_label = y_true.shape[-1] - 1
-        freespace_mask = tf.equal(tf.argmax(y_true, axis=-1), freespace_label)
-        known_mask     = ~tf.equal(tf.argmax(y_true, axis=-1), freespace_label-1)
-        occupied_mask  = tf.logical_and(~freespace_mask, known_mask)
-        ceil_mask = tf.equal(tf.argmax(y_true, axis=-1), 0)
-        floor_mask = tf.equal(tf.argmax(y_true, axis=-1), 1)
-        wall_mask = tf.equal(tf.argmax(y_true, axis=-1), 2)
-        object_mask = tf.logical_or(tf.logical_or(ceil_mask,floor_mask),wall_mask)
-
-
-        # Compute weighted cross entropy.
-        cross_entropy = y_true * tf.log(y_pred)
-        #print(tf.reduce_sum(tf.cast(freespace_mask, tf.float32)))
-        # Compute weighted cross entropy.
-        freespace_cross_entropy = \
-            -tf.reduce_sum(tf.boolean_mask(cross_entropy, freespace_mask)) / \
-             (tf.reduce_sum(tf.cast(freespace_mask, tf.float32)) + EPSILON)
-
+                         
+        weighted_cross_entropy = weights * y_true * tf.log(y_pred)
         occupied_cross_entropy = \
-            -tf.reduce_sum(tf.boolean_mask(cross_entropy, occupied_mask)) / \
-             (tf.reduce_sum(tf.cast(occupied_mask, tf.float32)) + EPSILON)
-        object_cross_entropy = \
-            -tf.reduce_sum(tf.boolean_mask(cross_entropy, object_mask)) / \
-             (tf.reduce_sum(tf.cast(object_mask, tf.float32)) + EPSILON)
+            -tf.reduce_sum(tf.boolean_mask(weighted_cross_entropy, occupied_mask)) / \
+             (tf.reduce_sum(weights* tf.expand_dims(tf.cast(occupied_mask, tf.float32),-1)) + EPSILON)
 
-        cross_entropy = freespace_cross_entropy + params["loss_weight"]*occupied_cross_entropy + 2*params["loss_weight"]*object_cross_entropy
-
-    return cross_entropy
-'''
-'''
-def categorical_crossentropy(y_true, y_pred, params):
-    nclasses = y_true.shape[-1]
-
-    with tf.name_scope("categorical_cross_entropy"):
-        y_true = tf.clip_by_value(y_true, EPSILON, 1.0 - EPSILON)
-        y_pred = tf.clip_by_value(y_pred, EPSILON, 1.0 - EPSILON)
-
-        # Measure how close we are to unknown class.
-        # unkown_weights = 1 - y_true[..., -2][..., None]
-        freespace_label = y_true.shape[-1] - 1
-        freespace_mask = tf.equal(tf.argmax(y_true, axis=-1), freespace_label)
-        known_mask     = ~tf.equal(tf.argmax(y_true, axis=-1), freespace_label-1)
-        occupied_mask  = tf.logical_and(~freespace_mask, known_mask)
-
-        # Compute weighted cross entropy.
-        cross_entropy = y_true * tf.log(y_pred)
-        print(tf.reduce_sum(tf.cast(freespace_mask, tf.float32)))  
-        # Compute weighted cross entropy.
-        freespace_cross_entropy = \
-            -tf.reduce_sum(tf.boolean_mask(cross_entropy, freespace_mask)) / \
-             (tf.reduce_sum(tf.cast(freespace_mask, tf.float32)) + EPSILON)
-
-        occupied_cross_entropy = \
-            -tf.reduce_sum(tf.boolean_mask(cross_entropy, occupied_mask)) / \
-             (tf.reduce_sum(tf.cast(occupied_mask, tf.float32)) + EPSILON)
-
-        cross_entropy = freespace_cross_entropy + params["loss_weight"]*occupied_cross_entropy
-
-    return cross_entropy
-'''
+    return cross_entropy+params["loss_weight"]*occupied_cross_entropy
 
 def build_model(params):
     batch_size = params["batch_size"]
@@ -463,7 +429,7 @@ def build_model(params):
     niter = params["niter"]
     #with tf.variable_scope("reconstruction"):
     # Setup placeholders and variables.
-    with tf.device('/gpu:' + str(0)): 
+    with tf.device('/gpu:' + str(0)):
         d = tf.placeholder(tf.float32, [None, nrows, ncols,
                                     nslices, nclasses], name="d")
     
@@ -471,45 +437,61 @@ def build_model(params):
         u_ = []
         m = []
         l = []
-        for level in range(nlevels):
-            factor = 2 ** level
-            assert nrows % factor == 0
-            assert ncols % factor == 0
-            assert nslices % factor == 0
-            nrows_level = nrows // factor
-            ncols_level = ncols // factor
-            nslices_level = nslices // factor
-            u.append(tf.placeholder(
-                         tf.float32, [None, nrows_level, ncols_level,
-                                      nslices_level, nclasses],
-                                      name="u{}".format(level)))
-            u_.append(tf.placeholder(
-                          tf.float32, [None, nrows_level, ncols_level,
-                                       nslices_level, nclasses],
-                                       name="u_{}".format(level)))
-            m.append(tf.placeholder(
-                         tf.float32, [None, nrows_level, ncols_level,
-                                      nslices_level, 3 * nclasses],
-                                      name="m{}".format(level)))
-            l.append(tf.placeholder(
-                         tf.float32, [None, nrows_level, ncols_level,
-                                      nslices_level],
-                                      name="l{}".format(level)))
     
-            with tf.variable_scope("weights_level{}".format(level)):
+        factor = 2 ** (nlevels-1)
+        assert nrows % factor == 0
+        assert ncols % factor == 0
+        assert nslices % factor == 0
+        nrows_level = nrows // factor
+        ncols_level = ncols // factor
+        nslices_level = nslices // factor
+        u.append(tf.placeholder(
+                     tf.float32, [None, nrows_level, ncols_level,
+                                  nslices_level, nclasses],
+                                  name="u{}".format(0)))
+        u_.append(tf.placeholder(
+                     tf.float32, [None, nrows_level, ncols_level,
+                                  nslices_level, nclasses],
+                                  name="u_{}".format(0)))
+        m.append(tf.placeholder(
+                     tf.float32, [None, nrows_level, ncols_level,
+                                  nslices_level, 3 * nclasses],
+                                  name="m{}".format(0)))
+        l.append(tf.placeholder(
+                     tf.float32, [None, nrows_level, ncols_level,
+                                  nslices_level],
+                                  name="l{}".format(0)))
+    
+        for iter in range(niter):
+            with tf.variable_scope("step{}".format(iter)):
+                stepsize_variable("sig",[1],value=0.2)
+                stepsize_variable("tau",[1],value=0.2)
+            with tf.variable_scope("weights_step{}".format(iter)):
                 conv_weight_variable(
-                        "w1", [2,2,2, nclasses, 3 * nclasses], stddev=0.001)
+                        "w1", [2,2,2, nclasses, 3 * nclasses], stddev=0.001) #filter size and kernal size can be changed
+                #conv_weight_variable(
+                #        "w2", [2,2,2, nclasses, 3 * nclasses], stddev=0.001)
+            with tf.variable_scope("dual_proxmitor_step{}".format(iter)):
                 conv_weight_variable(
-                        "w2", [2,2,2, nclasses, 3 * nclasses], stddev=0.001)
+                        "p1", [3,3,3, 6*nclasses, 6 * nclasses], stddev=0.001)
+                conv_weight_variable(
+                        "p2", [3,3,3, 6*nclasses, 3*nclasses], stddev=0.001)
+                d_pro1 = bias_weight_variable("d_pro1", [6*nclasses])
+                d_pro2 = bias_weight_variable("d_pro2", [3*nclasses])
+                #conv_weight_variable(
+                #        "p3", [2,2,2, 6*nclasses, 3 * nclasses], stddev=0.001)
+            with tf.variable_scope("primal_proxmitor_step{}".format(iter)):
+                conv_weight_variable(
+                        "pp1", [3,3,3,3 * nclasses, 3 * nclasses], stddev=0.001)
+                conv_weight_variable(
+                        "pp2", [3,3,3,3 * nclasses, 2 * nclasses], stddev=0.001)
+                p_pro1 = bias_weight_variable("p_pro1", [3*nclasses])
+                p_pro2 = bias_weight_variable("p_pro2", [2*nclasses])
+                #conv_weight_variable(
+                #        "pp3", [2,2,2,4 * nclasses, 2 * nclasses], stddev=0.001)
     
         #sig = params["sig"]
         #tau = params["tau"]
-        for iter in range(niter):
-            with tf.variable_scope("step_{}".format(iter)):
-                stepsize_variable("sig",[1],value=0.2)
-                stepsize_variable("tau",[1],value=0.2)
-        
-    
         d_lam = tf.multiply(d, lam, name="d_lam")
     
         d_encoded = []
@@ -538,20 +520,25 @@ def build_model(params):
                 d_residual += b3_d
     
                 d_encoded.append(d_lam + d_residual)
-    # Create a copy of the placeholders for the loop variables.
+# Create a copy of the placeholders for the loop variables.
+    with tf.device('/gpu:' + str(1)):
         u_loop = list(u)
         u_loop_= list(u_)
         m_loop = list(m)
         l_loop = list(l)
-    
-        for iter in range(20):
-            u_loop, u_loop_, m_loop, l_loop = primal_dual(
-                    u_loop, u_loop_, m_loop, l_loop, d_encoded,iter)
-            
-    with tf.device('/gpu:' + str(1)):
-        for iter in range(20,niter,1):
-            u_loop, u_loop_, m_loop, l_loop = primal_dual(
-                    u_loop, u_loop_, m_loop, l_loop, d_encoded,iter)
+        
+        for level in range(nlevels):
+            for iter in range(niter):
+                u_loop, u_loop_, m_loop, l_loop = primal_dual(
+                        u_loop, u_loop_, m_loop, l_loop, d_encoded,level, iter)
+            layer = tf.keras.layers.UpSampling3D(size=(2, 2, 2), data_format="channels_last")
+            if len(u_loop)<nlevels:
+                u_loop.append(layer.apply(u_loop[-1]))
+                u_loop_.append(layer.apply(u_loop_[-1]))
+                m_loop.append(layer.apply(m_loop[-1]))
+                l_loop.append(layer.apply(l_loop[-1]))
+
+        
         probs = u_loop
     
         for level in range(nlevels):
@@ -633,8 +620,7 @@ def build_data_generator(data_path,params,istrain=False):
     datacosts = []
     groundtruths = []
     scene_list = get_list_dir(data_path)
-    n=min(100,len(scene_list))
-    for i, scene_name in enumerate(scene_list[:n]):
+    for i, scene_name in enumerate(scene_list):
         print("Loading {} [{}/{}]".format(scene_name, i + 1, len(scene_list)))
         
         datacost_path = os.path.join(data_path, scene_name,"norm_datacost.npz")
@@ -741,7 +727,7 @@ def build_data_generator(data_path,params,istrain=False):
         if epoch_npasses > 0 and npasses >= epoch_npasses:
             npasses = 0
             yield
-
+            
 def get_learning_rate(batch, batch_size, init_learning_rate, decay_rate, decay_steps, min_learning_rate=0.00001):
     """ Get exponentially decaying learning rate clipped at min_learning_rate.
 
@@ -785,6 +771,7 @@ def train_model(data_path,val_path, model_path, params):
     time.sleep(0.2)
     print("memory used percent:",memory)
     print("CPU used:",cpu)
+
     
     tf_config = tf.ConfigProto()
     tf_config.gpu_options.allow_growth = True
@@ -794,49 +781,46 @@ def train_model(data_path,val_path, model_path, params):
 
     with tf.Session(config=tf_config) as sess:
         probs, datacost, u, u_, m, l = build_model(params)
-     
         memory,cpu=getMemCpu()
         time.sleep(0.2)
         print("after build model, memory used percent:",memory)
         print("CPU used:",cpu)
-             
+    
         batch_i = tf.Variable(0, name='batch_i')
         for variable in tf.trainable_variables():
             #if not variable.name.endswith('weights:0'):
             #    continue
             print(variable.name + ' - ' + str(variable.get_shape()) + ' - ' + str(np.prod(variable.get_shape().as_list())))
-        groundtruth = tf.placeholder(tf.float32, probs[0].shape, name="groundtruth")
+        groundtruth = tf.placeholder(tf.float32, probs[-1].shape, name="groundtruth")
     
         u_init = []
         u_init_ = []
         m_init = []
         l_init = []
-        for level in range(nlevels):
-            factor = 2 ** level
-            assert nrows % factor == 0
-            assert ncols % factor == 0
-            assert nslices % factor == 0
-            nrows_level = nrows // factor
-            ncols_level = ncols // factor
-            nslices_level = nslices // factor
-            u_init.append(np.empty([batch_size, nrows_level, ncols_level,
+        factor = 2 ** (nlevels-1)
+        assert nrows % factor == 0
+        assert ncols % factor == 0
+        assert nslices % factor == 0
+        nrows_level = nrows // factor
+        ncols_level = ncols // factor
+        nslices_level = nslices // factor
+        u_init.append(np.empty([batch_size, nrows_level, ncols_level,
                                     nslices_level, nclasses],
                                    dtype=np.float32))
-            u_init_.append(np.empty([batch_size, nrows_level, ncols_level,
-                                     nslices_level, nclasses],
-                                    dtype=np.float32))
-            m_init.append(np.empty([batch_size, nrows_level, ncols_level,
+        u_init_.append(np.empty([batch_size, nrows_level, ncols_level,
+                                    nslices_level, nclasses],
+                                   dtype=np.float32))
+        m_init.append(np.empty([batch_size, nrows_level, ncols_level,
                                     nslices_level, 3 * nclasses],
                                    dtype=np.float32))
-            l_init.append(np.empty([batch_size, nrows_level, ncols_level,
+        l_init.append(np.empty([batch_size, nrows_level, ncols_level,
                                     nslices_level],
                                    dtype=np.float32))
-        
-        loss_op = categorical_crossentropy(groundtruth, probs[0], params)
+        loss_op = categorical_crossentropy(groundtruth, probs[-1], params)
         freespace_accuracy_op, occupied_accuracy_op, semantic_accuracy_op = \
-            classification_accuracy(groundtruth, probs[0])
+            classification_accuracy(groundtruth, probs[-1])
         labels=np.arange(nclasses)
-        eachlabel_accuracy_op,countlabel_op=eachlabel_classification_accuracy(groundtruth,probs[0],labels)
+        eachlabel_accuracy_op,countlabel_op=eachlabel_classification_accuracy(groundtruth,probs[-1],labels)
         learning_rate_op=get_learning_rate(
                 batch_i, params['batch_size'], params['initial_learning_rate'], params['decay_rate'], params['decay_step'])
         tf.summary.scalar('learning_rate', learning_rate_op)
@@ -900,8 +884,8 @@ def train_model(data_path,val_path, model_path, params):
 
         model_saver.save(sess, os.path.join(checkpoint_path, "initial"),
                          write_meta_graph=True)
-        #train_saver.restore(sess, os.path.join(checkpoint_path, "checkpoint-00000000"))
-        #print("checkpoint-00000000 has been restored")
+        #train_saver.restore(sess, os.path.join(checkpoint_path, "checkpoint-00000003"))
+        #print("checkpoint-00000003 has been restored")
        
         for epoch in range(params["nepochs"]):
 
@@ -930,17 +914,15 @@ def train_model(data_path,val_path, model_path, params):
 
                 feed_dict[datacost] = datacost_batch
                 feed_dict[groundtruth] = groundtruth_batch
-
-                for level in range(nlevels):
-                    u_init[level][:] = 1.0 / nclasses
-                    u_init_[level][:] = 1.0 / nclasses
-                    m_init[level][:] = 0.0
-                    l_init[level][:] = 0.0
-                    feed_dict[u[level]] = u_init[level][:num_batch_samples]
-                    feed_dict[u_[level]] = u_init_[level][:num_batch_samples]
-                    feed_dict[m[level]] = m_init[level][:num_batch_samples]
-                    feed_dict[l[level]] = l_init[level][:num_batch_samples]
-
+                u_init[0][:] = 1.0 / nclasses
+                u_init_[0][:] = 1.0 / nclasses
+                m_init[0][:] = 0.0
+                l_init[0][:] = 0.0
+                feed_dict[u[0]] = u_init[0][:num_batch_samples]
+                feed_dict[u_[0]] = u_init_[0][:num_batch_samples]
+                feed_dict[m[0]] = m_init[0][:num_batch_samples]
+                feed_dict[l[0]] = l_init[0][:num_batch_samples]
+                
                 (_,
                  loss,
                  freespace_accuracy,
@@ -989,6 +971,7 @@ def train_model(data_path,val_path, model_path, params):
                 print("after training, memory used percent:",memory)
                 print("CPU used:",cpu)
 
+
             train_loss_value = \
                 np.nanmean(train_loss_values)
             train_freespace_accuracy_value = \
@@ -1016,16 +999,14 @@ def train_model(data_path,val_path, model_path, params):
 
                 feed_dict[datacost] = datacost_batch
                 feed_dict[groundtruth] = groundtruth_batch
-
-                for level in range(nlevels):
-                    u_init[level][:] = 1.0 / nclasses
-                    u_init_[level][:] = 1.0 / nclasses
-                    m_init[level][:] = 0.0
-                    l_init[level][:] = 0.0
-                    feed_dict[u[level]] = u_init[level][:num_batch_samples]
-                    feed_dict[u_[level]] = u_init_[level][:num_batch_samples]
-                    feed_dict[m[level]] = m_init[level][:num_batch_samples]
-                    feed_dict[l[level]] = l_init[level][:num_batch_samples]
+                u_init[0][:] = 1.0 / nclasses
+                u_init_[0][:] = 1.0 / nclasses
+                m_init[0][:] = 0.0
+                l_init[0][:] = 0.0
+                feed_dict[u[0]] = u_init[0][:num_batch_samples]
+                feed_dict[u_[0]] = u_init_[0][:num_batch_samples]
+                feed_dict[m[0]] = m_init[0][:num_batch_samples]
+                feed_dict[l[0]] = l_init[0][:num_batch_samples]
 
                 (loss,
                  freespace_accuracy,
@@ -1129,7 +1110,7 @@ def parse_args():
     parser.add_argument("--ncols", type=int, default=24)
     parser.add_argument("--nslices", type=int, default=24)
 
-    parser.add_argument("--niter", type=int, default=51)
+    parser.add_argument("--niter", type=int, default=15)
     parser.add_argument("--sig", type=float, default=0.2)
     parser.add_argument("--tau", type=float, default=0.2)
     parser.add_argument("--lam", type=float, default=1.0)
@@ -1140,10 +1121,10 @@ def parse_args():
     parser.add_argument("--val_nbatches", type=int, default=15)
     parser.add_argument("--learning_rate", type=float, default=0.0001)
     parser.add_argument("--softmax_scale", type=float, default=10)
-    parser.add_argument("--initial_learning_rate", type=float, default=0.0005)
+    parser.add_argument("--initial_learning_rate", type=float, default=0.0001)
     parser.add_argument("--decay_rate", type=float, default=0.99)
     parser.add_argument("--decay_step", type=int, default=90) 
-    parser.add_argument("--loss_weight", type=float, default=2)
+    parser.add_argument("--loss_weight", type=float, default=2) #5
     return parser.parse_args()
 
 def main():

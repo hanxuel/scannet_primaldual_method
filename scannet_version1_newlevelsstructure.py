@@ -295,7 +295,7 @@ def update_primal(u, u_, m, l, d, level, iter):
 
 
 def primal_dual(u, u_, m, l, d, level, iter):
-    #u_0 = list(u)
+    u_0 = list(u)
 
     #for level in list(range(len(u)))[::-1]:
     with tf.name_scope("primal_dual_iter{}_level{}".format(iter,level)):
@@ -305,7 +305,7 @@ def primal_dual(u, u_, m, l, d, level, iter):
 
         update_primal(u, u_, m, l, d, level, iter)
 
-            #u_[level] = 2 * u[level] - u_0[level]
+        u_[-1] = 2 * u[-1] - u_0[-1]
 
     return u, u_, m, l
 
@@ -583,7 +583,7 @@ def build_data_generator(data_path,params,istrain=False):
         datacosts.append(datacost)
         groundtruths.append(groundtruth)
 
-    idxs = np.arange(len(scene_list))
+    idxs = np.arange(len(datacosts))
     print("-------------------------number of scene is{}--------------------------------".format(len(scene_list)))
     batch_datacost = np.empty(
         (batch_size, nrows, ncols, nslices, nclasses), dtype=np.float32)
@@ -828,10 +828,10 @@ def train_model(data_path,val_path, model_path, params):
 
         model_saver.save(sess, os.path.join(checkpoint_path, "initial"),
                          write_meta_graph=True)
-        #train_saver.restore(sess, os.path.join(checkpoint_path, "checkpoint-00000003"))
-        #print("checkpoint-00000003 has been restored")
+        train_saver.restore(sess, os.path.join(checkpoint_path, "checkpoint-00000082"))
+        print("checkpoint-00000082 has been restored")
        
-        for epoch in range(params["nepochs"]):
+        for epoch in range(83,params["nepochs"]):
 
             train_loss_values = []
             train_freespace_accuracy_values = []
@@ -1090,7 +1090,7 @@ def parse_args():
     parser.add_argument("--initial_learning_rate", type=float, default=0.0001)
     parser.add_argument("--decay_rate", type=float, default=0.99)
     parser.add_argument("--decay_step", type=int, default=90) 
-    parser.add_argument("--loss_weight", type=float, default=10) #5
+    parser.add_argument("--loss_weight", type=float, default=4) #5
     return parser.parse_args()
 
 def main():

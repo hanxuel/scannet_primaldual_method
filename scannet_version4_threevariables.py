@@ -250,14 +250,14 @@ def update_dual(u_, m, iter):
 
     with tf.name_scope("dual_update"):
         if iter<5:
-            with tf.variable_scope("weights_step5".format(iter), reuse=True):
+            with tf.variable_scope("weights_step5", reuse=True):
                 w1 = tf.get_variable("w1")
 
         elif iter<10 and iter>=5:
-            with tf.variable_scope("weights_step10".format(iter), reuse=True):
+            with tf.variable_scope("weights_step10", reuse=True):
                 w1 = tf.get_variable("w1")
         elif iter<15 and iter>=10:
-            with tf.variable_scope("weights_step15".format(iter), reuse=True):
+            with tf.variable_scope("weights_step15", reuse=True):
                 w1 = tf.get_variable("w1")
             #w2 = tf.get_variable("w2")
 
@@ -322,14 +322,14 @@ def update_primal(u, u_, m, l, d, level, iter):
 
     with tf.name_scope("primal_update"):
         if iter<5:
-            with tf.variable_scope("weights_step5".format(iter), reuse=True):
+            with tf.variable_scope("weights_step5", reuse=True):
                 w1 = tf.get_variable("w1")
         
         elif iter<10 and iter>=5:
-            with tf.variable_scope("weights_step10".format(iter), reuse=True):
+            with tf.variable_scope("weights_step10", reuse=True):
                 w1 = tf.get_variable("w1")
         elif iter<15 and iter>=10:
-            with tf.variable_scope("weights_step15".format(iter), reuse=True):
+            with tf.variable_scope("weights_step15", reuse=True):
                 w1 = tf.get_variable("w1")
             #w2 = tf.get_variable("w2")
 
